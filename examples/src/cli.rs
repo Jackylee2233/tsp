@@ -3,7 +3,7 @@ use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use rustls::crypto::CryptoProvider;
-use std::{ops::Deref, path::PathBuf, str::FromStr};
+use std::{ops::Deref, path::PathBuf, str::FromStr, time::Duration};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, trace};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -274,11 +274,17 @@ async fn ensure_vid_verified(
     };
 
     if !ask
-        || prompt(format!(
-            "Do you want to verify receiver DID {}",
-            receiver_vid
-        ))
-        .await
+        || {
+            let receiver_vid = receiver_vid.to_string();
+            tokio::task::spawn_blocking(move || {
+                prompt(format!(
+                    "Do you want to verify receiver DID {}",
+                    receiver_vid
+                ))
+            })
+            .await
+            .unwrap()
+        }
     {
         vid_wallet.verify_vid(receiver_vid, None).await?;
         info!("{receiver_vid} is verified and added to the wallet {wallet_name}");
@@ -291,19 +297,14 @@ async fn ensure_vid_verified(
     }
 }
 
-async fn prompt(message: String) -> bool {
-    use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt};
-    let mut stdout = io::stdout();
-    stdout
-        .write_all(format!("{message}? [y/n]").as_bytes())
-        .await
-        .expect("I/O error");
-    stdout.flush().await.expect("I/O error");
+fn prompt(message: String) -> bool {
+    use std::io::{self, BufRead, Write};
+    print!("{message}? [y/n]");
+    io::stdout().flush().expect("I/O error");
     let mut line = String::new();
-    let mut stdin = io::BufReader::new(io::stdin());
-    stdin
+    io::stdin()
+        .lock()
         .read_line(&mut line)
-        .await
         .expect("could not read reply");
     line = line.to_uppercase();
 
@@ -493,9 +494,20 @@ async fn run() -> Result<(), Error> {
                     private_vid
                 }
             };
-            let (_, metadata) = verify_vid(private_vid.identifier())
-                .await
-                .map_err(|err| Error::Vid(VidError::InvalidVid(err.to_string())))?;
+            let mut retries = 5;
+            let (_, metadata) = loop {
+                let result = verify_vid(private_vid.identifier()).await;
+                match result {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        if retries == 0 {
+                            return Err(e.into());
+                        }
+                        retries -= 1;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            };
             vid_wallet.add_private_vid(private_vid.clone(), metadata)?;
             info!("created VID {}", private_vid.identifier());
         }
@@ -755,7 +767,11 @@ async fn run() -> Result<(), Error> {
                             route.len()
                         );
                         if args.yes
-                            || prompt("do you want to forward this message?".to_string()).await
+                            || tokio::task::spawn_blocking(move || {
+                                prompt("do you want to forward this message?".to_string())
+                            })
+                            .await
+                            .unwrap()
                         {
                             return Ok(Action::Forward(next_hop, route, opaque_payload));
                         }
@@ -785,10 +801,16 @@ async fn run() -> Result<(), Error> {
                         info!("message involving unknown party {}", unknown_vid);
 
                         let user_affirms = args.yes
-                            || prompt(format!(
-                                "received first time message from '{unknown_vid}', do you want to accept it?"
-                            ))
-                            .await;
+                            || {
+                                let unknown_vid = unknown_vid.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    prompt(format!(
+                                        "received first time message from '{unknown_vid}', do you want to accept it?"
+                                    ))
+                                })
+                                .await
+                                .unwrap()
+                            };
 
                         if user_affirms {
                             trace!("processing pending message");
