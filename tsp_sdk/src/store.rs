@@ -1,3 +1,5 @@
+#[cfg(feature = "resolve")]
+use crate::vid::resolve::verify_vid_offline;
 use crate::{
     ExportVid, OwnedVid,
     cesr::EnvelopeType,
@@ -7,7 +9,10 @@ use crate::{
         VerifiedVid,
     },
     error::Error,
-    vid::{VidError, resolve::verify_vid_offline},
+    queue::MessageQueue,
+    relationship_machine::{RelationshipEvent, RelationshipMachine, StateError},
+    retry::RetryPolicy,
+    vid::VidError,
 };
 #[cfg(feature = "async")]
 use bytes::Bytes;
@@ -16,8 +21,20 @@ use std::{
     collections::HashMap,
     fmt::Display,
     sync::{Arc, RwLock},
+    time::Instant,
 };
 use url::Url;
+
+/// Represents a pending relationship request, storing the event that triggered it
+/// and the thread ID associated with the request.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRequest {
+    pub(crate) event: RelationshipEvent,
+    pub(crate) thread_id: Digest,
+    pub(crate) message: Vec<u8>,
+    pub(crate) retry_count: u32,
+    pub(crate) last_attempt: Instant,
+}
 
 #[derive(Clone)]
 pub(crate) struct VidContext {
@@ -28,6 +45,8 @@ pub(crate) struct VidContext {
     parent_vid: Option<String>,
     tunnel: Option<Box<[String]>>,
     metadata: Option<serde_json::Value>,
+    request_timeout: Option<Instant>,
+    pending_request: Option<PendingRequest>,
 }
 
 impl VidContext {
@@ -48,7 +67,10 @@ impl VidContext {
         &mut self,
         relation_status: RelationshipStatus,
     ) -> RelationshipStatus {
-        std::mem::replace(&mut self.relation_status, relation_status)
+        let old = std::mem::replace(&mut self.relation_status, relation_status);
+        self.request_timeout = None; // Reset timeout on status change
+        self.pending_request = None; // Reset pending request on status change
+        old
     }
 
     /// Set the route for this VID. The route will be used to send routed messages to this VID
@@ -91,6 +113,7 @@ pub struct SecureStore {
     pub(crate) vids: Arc<RwLock<HashMap<String, VidContext>>>,
     pub(crate) aliases: Arc<RwLock<Aliases>>,
     pub(crate) keys: Arc<RwLock<WebvhUpdateKeys>>,
+    pub(crate) queue: Arc<RwLock<MessageQueue>>,
 }
 
 /// This wallet is used to store and resolve VIDs
@@ -151,6 +174,8 @@ impl SecureStore {
                     parent_vid: vid.parent_vid,
                     tunnel: vid.tunnel,
                     metadata: vid.metadata,
+                    request_timeout: None,
+                    pending_request: None,
                 },
             );
 
@@ -197,6 +222,8 @@ impl SecureStore {
                 vid: verified_vid,
                 private: None,
                 relation_status: RelationshipStatus::Unrelated,
+                request_timeout: None,
+                pending_request: None,
                 relation_vid: None,
                 parent_vid: None,
                 tunnel: None,
@@ -226,6 +253,8 @@ impl SecureStore {
                 vid: vid.clone(),
                 private: Some(vid),
                 relation_status: RelationshipStatus::Unrelated,
+                request_timeout: None,
+                pending_request: None,
                 relation_vid: None,
                 parent_vid: None,
                 tunnel: None,
@@ -738,16 +767,80 @@ impl SecureStore {
                         })
                     }
                     Payload::RequestRelationship { route, thread_id } => {
-                        Ok(ReceivedTspMessage::RequestRelationship {
-                            sender,
-                            receiver: intended_receiver,
-                            route: route.map(|vec| vec.iter().map(|vid| vid.to_vec()).collect()),
-                            thread_id,
-                            nested_vid: None,
-                        })
+                        // State Machine Check
+                        let current_status = self.get_vid(&sender)?.relation_status.clone();
+                        let event = RelationshipEvent::ReceiveRequest { thread_id };
+
+                        match RelationshipMachine::transition(&current_status, event) {
+                            Ok(new_status) => {
+                                self.set_relation_and_status_for_vid(
+                                    &sender,
+                                    new_status,
+                                    receiver_pid.identifier(),
+                                )?;
+                                Ok(ReceivedTspMessage::RequestRelationship {
+                                    sender,
+                                    receiver: intended_receiver,
+                                    route: route
+                                        .map(|vec| vec.iter().map(|vid| vid.to_vec()).collect()),
+                                    thread_id,
+                                    nested_vid: None,
+                                })
+                            }
+                            Err(StateError::ConcurrencyConflict) => {
+                                // Handle concurrency: compare thread_ids
+                                // We need to know *our* thread_id from the current status
+                                if let RelationshipStatus::Unidirectional {
+                                    thread_id: my_thread_id,
+                                } = current_status
+                                {
+                                    if my_thread_id < thread_id {
+                                        // My request wins, ignore theirs (or reject)
+                                        // For now, we just return an error or ignore.
+                                        // Returning error might be better for visibility.
+                                        Err(Error::Relationship(
+                                            "Concurrent request conflict: my request has priority"
+                                                .into(),
+                                        ))
+                                    } else {
+                                        // Their request wins, accept theirs
+                                        // Transition to ReverseUnidirectional
+                                        let new_status =
+                                            RelationshipStatus::ReverseUnidirectional { thread_id };
+                                        self.set_relation_and_status_for_vid(
+                                            &sender,
+                                            new_status,
+                                            receiver_pid.identifier(),
+                                        )?;
+
+                                        Ok(ReceivedTspMessage::RequestRelationship {
+                                            sender,
+                                            receiver: intended_receiver,
+                                            route: route.map(|vec| {
+                                                vec.iter().map(|vid| vid.to_vec()).collect()
+                                            }),
+                                            thread_id,
+                                            nested_vid: None,
+                                        })
+                                    }
+                                } else {
+                                    Err(Error::State(StateError::ConcurrencyConflict))
+                                }
+                            }
+                            Err(e) => Err(Error::State(e)),
+                        }
                     }
                     Payload::AcceptRelationship { thread_id } => {
-                        self.upgrade_relation(receiver_pid.identifier(), &sender, thread_id)?;
+                        // State Machine Check
+                        let current_status = self.get_vid(&sender)?.relation_status.clone();
+                        let event = RelationshipEvent::ReceiveAccept { thread_id };
+                        let new_status = RelationshipMachine::transition(&current_status, event)?;
+
+                        self.set_relation_and_status_for_vid(
+                            &sender,
+                            new_status,
+                            receiver_pid.identifier(),
+                        )?;
 
                         Ok(ReceivedTspMessage::AcceptRelationship {
                             sender,
@@ -756,30 +849,34 @@ impl SecureStore {
                         })
                     }
                     Payload::CancelRelationship { thread_id } => {
-                        if let Some(context) = self.vids.write()?.get_mut(&sender) {
-                            match context.relation_status {
-                                RelationshipStatus::Bidirectional {
-                                    thread_id: digest, ..
-                                }
-                                | RelationshipStatus::Unidirectional { thread_id: digest }
-                                | RelationshipStatus::ReverseUnidirectional { thread_id: digest } =>
-                                {
-                                    if thread_id != digest {
-                                        return Err(Error::Relationship(
-                                            "invalid attempt to end the relationship, wrong thread_id".into(),
-                                        ));
-                                    }
-                                    context.relation_status = RelationshipStatus::Unrelated;
-                                    context.relation_vid = None;
-                                }
-                                RelationshipStatus::_Controlled => {
+                        // State Machine Check
+                        let current_status = self.get_vid(&sender)?.relation_status.clone();
+
+                        // Verify thread_id matches before transition
+                        match &current_status {
+                            RelationshipStatus::Bidirectional {
+                                thread_id: digest, ..
+                            }
+                            | RelationshipStatus::Unidirectional { thread_id: digest }
+                            | RelationshipStatus::ReverseUnidirectional { thread_id: digest } => {
+                                if &thread_id != digest {
                                     return Err(Error::Relationship(
-                                        "you cannot cancel a relationship with yourself".into(),
+                                        "invalid attempt to end the relationship, wrong thread_id"
+                                            .into(),
                                     ));
                                 }
-                                RelationshipStatus::Unrelated => {}
                             }
+                            _ => {} // Unrelated or Controlled, let state machine handle invalid transition
                         }
+
+                        let event = RelationshipEvent::ReceiveCancel;
+                        let new_status = RelationshipMachine::transition(&current_status, event)?;
+
+                        self.set_relation_and_status_for_vid(
+                            &sender,
+                            new_status,
+                            receiver_pid.identifier(),
+                        )?;
 
                         Ok(ReceivedTspMessage::CancelRelationship {
                             sender,
@@ -787,71 +884,91 @@ impl SecureStore {
                         })
                     }
                     Payload::RequestNestedRelationship { inner, thread_id } => {
-                        let EnvelopeType::SignedMessage {
-                            sender: inner_vid,
-                            receiver: None,
-                            ..
-                        } = crate::cesr::probe(inner)?
-                        else {
+                        #[cfg(not(feature = "resolve"))]
+                        {
+                            let _ = (inner, thread_id);
                             return Err(Error::Relationship(
-                                "invalid nested request, not a signed message".into(),
+                                "Nested relationships require 'resolve' feature".into(),
                             ));
-                        };
+                        }
+                        #[cfg(feature = "resolve")]
+                        {
+                            let EnvelopeType::SignedMessage {
+                                sender: inner_vid,
+                                receiver: None,
+                                ..
+                            } = crate::cesr::probe(inner)?
+                            else {
+                                return Err(Error::Relationship(
+                                    "invalid nested request, not a signed message".into(),
+                                ));
+                            };
 
-                        let inner_vid = std::str::from_utf8(inner_vid)?.to_string();
+                            let inner_vid = std::str::from_utf8(inner_vid)?.to_string();
 
-                        self.add_nested_vid(&inner_vid)?;
+                            self.add_nested_vid(&inner_vid)?;
 
-                        // the act of opening this message is simply verifying the signature, because this SDK doesn't yet
-                        // support sending data as part of control messages. This can easily change.
-                        let _ = self.open_message(inner)?;
+                            // the act of opening this message is simply verifying the signature, because this SDK doesn't yet
+                            // support sending data as part of control messages. This can easily change.
+                            let _ = self.open_message(inner)?;
 
-                        self.set_parent_for_vid(&inner_vid, Some(&sender))?;
+                            self.set_parent_for_vid(&inner_vid, Some(&sender))?;
 
-                        Ok(ReceivedTspMessage::RequestRelationship {
-                            sender,
-                            receiver: intended_receiver,
-                            route: None,
-                            thread_id,
-                            nested_vid: Some(inner_vid),
-                        })
+                            Ok(ReceivedTspMessage::RequestRelationship {
+                                sender,
+                                receiver: intended_receiver,
+                                route: None,
+                                thread_id,
+                                nested_vid: Some(inner_vid),
+                            })
+                        }
                     }
                     Payload::AcceptNestedRelationship { thread_id, inner } => {
-                        let EnvelopeType::SignedMessage {
-                            sender: vid,
-                            receiver: Some(connect_to_vid),
-                            ..
-                        } = crate::cesr::probe(inner)?
-                        else {
+                        #[cfg(not(feature = "resolve"))]
+                        {
+                            let _ = (inner, thread_id);
                             return Err(Error::Relationship(
-                                "invalid nested accept reply, not a signed message".into(),
+                                "Nested relationships require 'resolve' feature".into(),
                             ));
-                        };
+                        }
+                        #[cfg(feature = "resolve")]
+                        {
+                            let EnvelopeType::SignedMessage {
+                                sender: vid,
+                                receiver: Some(connect_to_vid),
+                                ..
+                            } = crate::cesr::probe(inner)?
+                            else {
+                                return Err(Error::Relationship(
+                                    "invalid nested accept reply, not a signed message".into(),
+                                ));
+                            };
 
-                        let vid = std::str::from_utf8(vid)?.to_string();
-                        let connect_to_vid = std::str::from_utf8(connect_to_vid)?.to_string();
-                        self.add_nested_vid(&vid)?;
+                            let vid = std::str::from_utf8(vid)?.to_string();
+                            let connect_to_vid = std::str::from_utf8(connect_to_vid)?.to_string();
+                            self.add_nested_vid(&vid)?;
 
-                        let _ = self.open_message(inner)?;
+                            let _ = self.open_message(inner)?;
 
-                        self.set_parent_for_vid(&vid, Some(&sender))?;
-                        self.add_nested_relation(&sender, &vid, thread_id)?;
-                        self.set_relation_and_status_for_vid(
-                            &connect_to_vid,
-                            RelationshipStatus::bi_default(),
-                            &vid,
-                        )?;
-                        self.set_relation_and_status_for_vid(
-                            &vid,
-                            RelationshipStatus::bi_default(),
-                            &connect_to_vid,
-                        )?;
+                            self.set_parent_for_vid(&vid, Some(&sender))?;
+                            self.add_nested_relation(&sender, &vid, thread_id)?;
+                            self.set_relation_and_status_for_vid(
+                                &connect_to_vid,
+                                RelationshipStatus::bi_default(),
+                                &vid,
+                            )?;
+                            self.set_relation_and_status_for_vid(
+                                &vid,
+                                RelationshipStatus::bi_default(),
+                                &connect_to_vid,
+                            )?;
 
-                        Ok(ReceivedTspMessage::AcceptRelationship {
-                            sender,
-                            receiver: intended_receiver,
-                            nested_vid: Some(vid),
-                        })
+                            Ok(ReceivedTspMessage::AcceptRelationship {
+                                sender,
+                                receiver: intended_receiver,
+                                nested_vid: Some(vid),
+                            })
+                        }
                     }
                     Payload::NewIdentifier { thread_id, new_vid } => {
                         let vid = std::str::from_utf8(new_vid)?.to_string();
@@ -926,45 +1043,73 @@ impl SecureStore {
         }
     }
 
-    /// Make relationship request messages. The receiver vid has to be a publicly discoverable Vid.
-    pub fn make_relationship_request(
+    /// Prepare a relationship request message without modifying the state.
+    /// Returns the new status and the TSP message.
+    pub fn prepare_relationship_request(
         &self,
         sender: &str,
         receiver: &str,
         route: Option<&[&str]>,
-    ) -> Result<(Url, Vec<u8>), Error> {
-        let sender = self.get_private_vid(sender)?;
-        let receiver = self.get_verified_vid(receiver)?;
+    ) -> Result<(RelationshipStatus, Url, Vec<u8>, Digest), Error> {
+        let sender_vid = self.get_private_vid(sender)?;
+        let receiver_vid = self.get_verified_vid(receiver)?;
 
         let path = route;
-        let route = route.map(|collection| collection.iter().map(|vid| vid.as_ref()).collect());
+        let route_payload =
+            route.map(|collection| collection.iter().map(|vid| vid.as_ref()).collect());
 
         let mut thread_id = Default::default();
+        let current_status = self.get_vid(receiver)?.relation_status.clone();
+
         let tsp_message = crate::crypto::seal_and_hash(
-            &*sender,
-            &*receiver,
+            &*sender_vid,
+            &*receiver_vid,
             None,
             Payload::RequestRelationship {
-                route,
+                route: route_payload,
                 thread_id: Default::default(),
             },
             Some(&mut thread_id),
         )?;
 
+        let event = RelationshipEvent::SendRequest { thread_id };
+        let new_status = RelationshipMachine::transition(&current_status, event)?;
+
         let (transport, tsp_message) = if let Some(hop_list) = path {
-            self.set_route_for_vid(receiver.identifier(), hop_list)?;
+            self.set_route_for_vid(receiver_vid.identifier(), hop_list)?;
             self.resolve_route_and_send(hop_list, &tsp_message)?
         } else {
-            (receiver.endpoint().clone(), tsp_message)
+            (receiver_vid.endpoint().clone(), tsp_message)
         };
 
-        self.set_relation_and_status_for_vid(
-            receiver.identifier(),
-            RelationshipStatus::Unidirectional { thread_id },
-            sender.identifier(),
-        )?;
+        Ok((new_status, transport, tsp_message, thread_id))
+    }
 
-        Ok((transport, tsp_message.to_owned()))
+    /// Commit the state change for a relationship request.
+    pub fn commit_relationship_request(
+        &self,
+        sender: &str,
+        receiver: &str,
+        new_status: RelationshipStatus,
+        thread_id: Digest,
+        tsp_message: &[u8],
+    ) -> Result<(), Error> {
+        let mut vids = self.vids.write().unwrap();
+        if let Some(context) = vids.get_mut(receiver) {
+            context.relation_status = new_status;
+            let retry_policy = RetryPolicy::default();
+            context.request_timeout = Some(Instant::now() + retry_policy.initial_delay);
+            context.pending_request = Some(PendingRequest {
+                event: RelationshipEvent::SendRequest { thread_id },
+                thread_id,
+                message: tsp_message.to_owned(),
+                retry_count: 0,
+                last_attempt: Instant::now(),
+            });
+            context.relation_vid = Some(sender.to_string());
+        }
+
+        Ok(())
     }
 
     /// Accept a direct relationship between the resolved VIDs identifier by `sender` and `receiver`.
@@ -977,6 +1122,11 @@ impl SecureStore {
         thread_id: Digest,
         route: Option<&[&str]>,
     ) -> Result<(Url, Vec<u8>), Error> {
+        // State Machine Check
+        let current_status = self.get_vid(receiver)?.relation_status.clone();
+        let event = RelationshipEvent::SendAccept { thread_id };
+        let new_status = RelationshipMachine::transition(&current_status, event)?;
+
         let (transport, tsp_message) = self.seal_message_payload(
             sender,
             receiver,
@@ -991,14 +1141,7 @@ impl SecureStore {
             (transport.to_owned(), tsp_message)
         };
 
-        self.set_relation_and_status_for_vid(
-            receiver,
-            RelationshipStatus::Bidirectional {
-                thread_id,
-                outstanding_nested_thread_ids: Default::default(),
-            },
-            sender,
-        )?;
+        self.set_relation_and_status_for_vid(receiver, new_status, sender)?;
 
         Ok((transport, tsp_message))
     }
@@ -1186,46 +1329,11 @@ impl SecureStore {
         self.forward_routed_message(&next_hop, path, opaque_message)
     }
 
+    #[cfg(feature = "resolve")]
     fn add_nested_vid(&self, vid: &str) -> Result<(), Error> {
         let nested_vid = verify_vid_offline(vid)?;
 
         self.add_verified_vid(nested_vid, None)
-    }
-
-    fn upgrade_relation(
-        &self,
-        my_vid: &str,
-        other_vid: &str,
-        thread_id: Digest,
-    ) -> Result<(), Error> {
-        let mut vids = self.vids.write()?;
-        let Some(context) = vids.get_mut(other_vid) else {
-            return Err(Error::Relationship(format!(
-                "unknown other vid {other_vid}"
-            )));
-        };
-
-        let RelationshipStatus::Unidirectional { thread_id: digest } = context.relation_status
-        else {
-            return Err(Error::Relationship(format!(
-                "no unidirectional relationship with {other_vid}, cannot upgrade"
-            )));
-        };
-
-        if thread_id != digest {
-            return Err(Error::Relationship(
-                "thread_id does not match digest".to_string(),
-            ));
-        }
-
-        context.relation_vid = Some(my_vid.to_string());
-
-        context.relation_status = RelationshipStatus::Bidirectional {
-            thread_id: digest,
-            outstanding_nested_thread_ids: Default::default(),
-        };
-
-        Ok(())
     }
 
     fn add_nested_thread_id(&self, vid: &str, thread_id: Digest) -> Result<(), Error> {
@@ -1247,6 +1355,90 @@ impl SecureStore {
         Ok(())
     }
 
+    /// Check for timed out relationship requests and handle them.
+    /// Returns a list of messages that need to be re-sent (Url, Message).
+    pub fn check_timeouts(&self) -> Result<Vec<(Url, Vec<u8>)>, Error> {
+        let mut vids = self.vids.write().unwrap();
+        let mut messages_to_resend = Vec::new();
+        let now = Instant::now();
+        let retry_policy = RetryPolicy::default();
+
+        // TODO: Consider adding a dedicated `tracing` feature in Cargo.toml for more granular control.
+        // Currently, tracing is tied to the `async` feature. See Cargo.toml line 31.
+        for (vid, context) in vids.iter_mut() {
+            if let Some(timeout) = context.request_timeout {
+                if now > timeout {
+                    // Timeout occurred
+                    if let Some(pending) = &mut context.pending_request {
+                        if let Some(next_delay) = retry_policy.next_timeout(pending.retry_count) {
+                            // Retry
+                            pending.retry_count += 1;
+                            pending.last_attempt = now;
+                            context.request_timeout = Some(now + next_delay);
+
+                            #[cfg(feature = "async")]
+                            tracing::info!(
+                                "Retrying relationship request to {} (attempt {}). Event: {:?}, ThreadID: {:?}",
+                                vid,
+                                pending.retry_count,
+                                pending.event,
+                                pending.thread_id
+                            );
+
+                            // We need the endpoint to resend
+                            // Since we are inside a write lock, we can't easily call get_verified_vid which takes a read lock or similar.
+                            // But context.vid is Arc<dyn VerifiedVid>, so we can use it directly.
+                            let endpoint = context.vid.endpoint().clone();
+                            messages_to_resend.push((endpoint, pending.message.clone()));
+                            continue;
+                        }
+                    }
+
+                    // Retries exhausted or no pending request data
+                    #[cfg(feature = "async")]
+                    tracing::warn!("Relationship request to {} timed out after retries", vid);
+                    let event = RelationshipEvent::Timeout;
+                    match RelationshipMachine::transition(&context.relation_status, event) {
+                        Ok(new_status) => {
+                            context.relation_status = new_status;
+                            context.request_timeout = None;
+                            context.pending_request = None;
+                        }
+                        Err(_e) => {
+                            #[cfg(feature = "async")]
+                            tracing::error!("Error handling timeout for {}: {}", vid, _e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(messages_to_resend)
+    }
+
+    /// Queue a message for later delivery.
+    pub fn queue_message(&self, url: Url, message: Vec<u8>) -> Result<(), Error> {
+        let mut queue = self.queue.write().unwrap();
+        queue.push(url, message);
+        Ok(())
+    }
+
+    /// Retrieve pending messages from the queue.
+    /// This removes them from the queue, so the caller is responsible for sending them.
+    /// If sending fails again, they should be re-queued.
+    pub fn retrieve_pending_messages(&self) -> Result<Vec<(Url, Vec<u8>)>, Error> {
+        let mut queue = self.queue.write().unwrap();
+        let mut messages = Vec::new();
+        while let Some(msg) = queue.pop() {
+            messages.push((msg.url, msg.message));
+        }
+        Ok(messages)
+    }
+
+    /// Add a nested relationship to a parent VID.
+    ///
+    /// This updates the parent's state to track the nested relationship and
+    /// initializes the nested VID's state.
     fn add_nested_relation(
         &self,
         parent_vid: &str,
@@ -1254,7 +1446,7 @@ impl SecureStore {
         thread_id: Digest,
     ) -> Result<(), Error> {
         let mut vids = self.vids.write()?;
-        let Some(context) = vids.get_mut(parent_vid) else {
+        let Some(parent_context) = vids.get_mut(parent_vid) else {
             return Err(Error::Relationship(format!(
                 "unknown parent vid {parent_vid}"
             )));
@@ -1263,7 +1455,7 @@ impl SecureStore {
         let RelationshipStatus::Bidirectional {
             ref mut outstanding_nested_thread_ids,
             ..
-        } = context.relation_status
+        } = parent_context.relation_status
         else {
             return Err(Error::Relationship(format!(
                 "no relationship set for parent vid {parent_vid}"
@@ -1281,13 +1473,13 @@ impl SecureStore {
         };
         outstanding_nested_thread_ids.remove(index);
 
-        let Some(context) = vids.get_mut(nested_vid) else {
+        let Some(nested_context) = vids.get_mut(nested_vid) else {
             return Err(Error::Relationship(format!(
                 "unknown nested vid {nested_vid}"
             )));
         };
 
-        context.relation_status = RelationshipStatus::Bidirectional {
+        nested_context.relation_status = RelationshipStatus::Bidirectional {
             thread_id,
             outstanding_nested_thread_ids: Default::default(),
         };
@@ -1386,7 +1578,7 @@ mod test {
 
     #[test]
     #[wasm_bindgen_test]
-    fn test_make_relationship_request() {
+    fn test_prepare_relationship_request() {
         let store = SecureStore::new();
         let alice = new_vid();
         let bob = new_vid();
@@ -1394,8 +1586,18 @@ mod test {
         store.add_private_vid(alice.clone(), None).unwrap();
         store.add_private_vid(bob.clone(), None).unwrap();
 
-        let (url, mut sealed) = store
-            .make_relationship_request(alice.identifier(), bob.identifier(), None)
+        let (new_status, url, mut sealed, thread_id) = store
+            .prepare_relationship_request(alice.identifier(), bob.identifier(), None)
+            .unwrap();
+
+        store
+            .commit_relationship_request(
+                alice.identifier(),
+                bob.identifier(),
+                new_status,
+                thread_id,
+                &sealed,
+            )
             .unwrap();
 
         assert_eq!(url.as_str(), "tcp://127.0.0.1:1337");
@@ -1420,8 +1622,17 @@ mod test {
         store.add_private_vid(bob.clone(), None).unwrap();
 
         // alice wants to establish a relation
-        let (url, mut sealed) = store
-            .make_relationship_request(alice.identifier(), bob.identifier(), None)
+        let (new_status, url, mut sealed, thread_id) = store
+            .prepare_relationship_request(alice.identifier(), bob.identifier(), None)
+            .unwrap();
+        store
+            .commit_relationship_request(
+                alice.identifier(),
+                bob.identifier(),
+                new_status,
+                thread_id,
+                &sealed,
+            )
             .unwrap();
 
         assert_eq!(url.as_str(), "tcp://127.0.0.1:1337");
@@ -1461,8 +1672,17 @@ mod test {
         store.add_private_vid(bob.clone(), None).unwrap();
 
         // alice wants to establish a relation
-        let (url, mut sealed) = store
-            .make_relationship_request(alice.identifier(), bob.identifier(), None)
+        let (new_status, url, mut sealed, thread_id) = store
+            .prepare_relationship_request(alice.identifier(), bob.identifier(), None)
+            .unwrap();
+        store
+            .commit_relationship_request(
+                alice.identifier(),
+                bob.identifier(),
+                new_status,
+                thread_id,
+                &sealed,
+            )
             .unwrap();
 
         assert_eq!(url.as_str(), "tcp://127.0.0.1:1337");
@@ -1830,6 +2050,7 @@ mod test {
         );
     }
 
+    #[cfg(feature = "resolve")]
     #[cfg(not(feature = "pq"))]
     #[test]
     #[wasm_bindgen_test]
@@ -1846,8 +2067,17 @@ mod test {
         a_store.add_verified_vid(b.clone(), None).unwrap();
         b_store.add_verified_vid(a.clone(), None).unwrap();
 
-        let (_url, mut sealed) = a_store
-            .make_relationship_request(a.identifier(), b.identifier(), None)
+        let (new_status, _url, mut sealed, thread_id) = a_store
+            .prepare_relationship_request(a.identifier(), b.identifier(), None)
+            .unwrap();
+        a_store
+            .commit_relationship_request(
+                a.identifier(),
+                b.identifier(),
+                new_status,
+                thread_id,
+                &sealed,
+            )
             .unwrap();
 
         let received = b_store.open_message(&mut sealed).unwrap();

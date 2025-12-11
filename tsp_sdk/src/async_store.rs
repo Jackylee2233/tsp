@@ -259,16 +259,6 @@ impl AsyncSecureStore {
         Ok(())
     }
 
-    pub fn make_relationship_request(
-        &self,
-        sender: &str,
-        receiver: &str,
-        route: Option<&[&str]>,
-    ) -> Result<(Url, Vec<u8>), Error> {
-        self.inner
-            .make_relationship_request(sender, receiver, route)
-    }
-
     /// Request a direct relationship with a resolved VID using the TSP
     /// Encodes the control message, encrypts, signs, and sends a TSP message
     ///
@@ -302,9 +292,17 @@ impl AsyncSecureStore {
         receiver: &str,
         route: Option<&[&str]>,
     ) -> Result<(), Error> {
-        let (endpoint, message) = self
+        let (new_status, endpoint, message, thread_id) = self
             .inner
-            .make_relationship_request(sender, receiver, route)?;
+            .prepare_relationship_request(sender, receiver, route)?;
+
+        self.inner.commit_relationship_request(
+            sender,
+            receiver,
+            new_status,
+            thread_id,
+            &message,
+        )?;
 
         tracing::info!("sending message to {endpoint}");
 

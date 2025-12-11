@@ -102,27 +102,52 @@ impl Store {
     }
 
     #[wasm_bindgen]
-    pub fn make_relationship_request(
+    pub fn prepare_relationship_request(
         &self,
         sender: String,
         receiver: String,
         route: Option<Vec<String>>,
-    ) -> Result<SealedMessage, Error> {
+    ) -> Result<JsValue, Error> {
         let route_items: Vec<&str> = route.iter().flatten().map(|s| s.as_str()).collect();
 
-        let (url, sealed) = self
+        let (new_status, url, sealed, thread_id) = self
             .0
-            .make_relationship_request(
+            .prepare_relationship_request(
                 &sender,
                 &receiver,
                 route.as_ref().map(|_| route_items.as_slice()),
             )
             .map_err(Error)?;
 
-        Ok(SealedMessage {
-            url: url.to_string(),
-            sealed,
-        })
+        Ok(serde_wasm_bindgen::to_value(&serde_json::json!({
+            "new_status": new_status,
+            "url": url.to_string(),
+            "sealed": sealed,
+            "thread_id": thread_id,
+        }))
+        .unwrap())
+    }
+
+    #[wasm_bindgen]
+    pub fn commit_relationship_request(
+        &self,
+        sender: String,
+        receiver: String,
+        new_status: JsValue,
+        thread_id: Vec<u8>,
+        tsp_message: Vec<u8>,
+    ) -> Result<(), Error> {
+        let new_status: tsp_sdk::RelationshipStatus =
+            serde_wasm_bindgen::from_value(new_status).unwrap();
+        self.0
+            .commit_relationship_request(
+                &sender,
+                &receiver,
+                new_status,
+                thread_id.try_into().unwrap(),
+                &tsp_message,
+            )
+            .map_err(Error)
     }
 
     #[wasm_bindgen]

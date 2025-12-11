@@ -45,13 +45,20 @@ class AliceBob(unittest.TestCase):
                 self.fail(f"unexpected message type {other}")
 
     def test_make_relationship_request(self):
-        url, sealed = self.store.make_relationship_request(
+        result = self.store.prepare_relationship_request(
             self.alice.identifier(), self.bob.identifier(), None
         )
+        self.store.commit_relationship_request(
+            self.alice.identifier(),
+            self.bob.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
+        )
 
-        self.assertEqual(url, "tcp://127.0.0.1:1337")
+        self.assertEqual(result["url"], "tcp://127.0.0.1:1337")
 
-        received = self.store.open_message(sealed)
+        received = self.store.open_message(result["sealed"])
 
         match received:
             case tsp.RequestRelationship(
@@ -64,12 +71,19 @@ class AliceBob(unittest.TestCase):
                 self.fail(f"unexpected message type {other}")
 
     def test_make_relationship_accept(self):
-        url, sealed = self.store.make_relationship_request(
+        result = self.store.prepare_relationship_request(
             self.alice.identifier(), self.bob.identifier(), None
         )
-        self.assertEqual(url, "tcp://127.0.0.1:1337")
+        self.store.commit_relationship_request(
+            self.alice.identifier(),
+            self.bob.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
+        )
+        self.assertEqual(result["url"], "tcp://127.0.0.1:1337")
 
-        received = self.store.open_message(sealed)
+        received = self.store.open_message(result["sealed"])
         match received:
             case tsp.RequestRelationship(
                 sender, receiver, _route, _nested_vid, thread_id
@@ -95,12 +109,19 @@ class AliceBob(unittest.TestCase):
                 self.fail(f"unexpected message type {other}")
 
     def test_make_relationship_cancel(self):
-        url, sealed = self.store.make_relationship_request(
+        result = self.store.prepare_relationship_request(
             self.alice.identifier(), self.bob.identifier(), None
         )
-        self.assertEqual(url, "tcp://127.0.0.1:1337")
+        self.store.commit_relationship_request(
+            self.alice.identifier(),
+            self.bob.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
+        )
+        self.assertEqual(result["url"], "tcp://127.0.0.1:1337")
 
-        received = self.store.open_message(sealed)
+        received = self.store.open_message(result["sealed"])
         match received:
             case tsp.RequestRelationship(
                 sender, receiver, _route, _nested_vid, thread_id
@@ -178,11 +199,24 @@ class AliceBob(unittest.TestCase):
         d_store.add_verified_owned_vid(mailbox_c)
 
         # relations
+        result = a_store.prepare_relationship_request(nette_a.identifier(), b.identifier(), None)
+        a_store.commit_relationship_request(
+            nette_a.identifier(),
+            b.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
+        )
 
-        a_store.make_relationship_request(nette_a.identifier(), b.identifier(), None)
-
-        a_store.make_relationship_request(
+        result = a_store.prepare_relationship_request(
             sneaky_a.identifier(), sneaky_d.identifier(), None
+        )
+        a_store.commit_relationship_request(
+            sneaky_a.identifier(),
+            sneaky_d.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
         )
 
         a_store.set_route_for_vid(
@@ -190,10 +224,24 @@ class AliceBob(unittest.TestCase):
             [b.identifier(), c.identifier(), mailbox_c.identifier()],
         )
 
-        b_store.make_relationship_request(b.identifier(), c.identifier(), None)
+        result = b_store.prepare_relationship_request(b.identifier(), c.identifier(), None)
+        b_store.commit_relationship_request(
+            b.identifier(),
+            c.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
+        )
 
-        c_store.make_relationship_request(
+        result = c_store.prepare_relationship_request(
             nette_d.identifier(), mailbox_c.identifier(), None
+        )
+        c_store.commit_relationship_request(
+            nette_d.identifier(),
+            mailbox_c.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
         )
 
         # that was all the setup, now let's run some things
@@ -263,12 +311,19 @@ class AliceBob(unittest.TestCase):
         a_store.add_verified_owned_vid(b)
         b_store.add_verified_owned_vid(a)
 
-        url, sealed = a_store.make_relationship_request(
+        result = a_store.prepare_relationship_request(
             a.identifier(), b.identifier(), None
         )
-        self.assertEqual(url, "tcp://127.0.0.1:1337")
+        a_store.commit_relationship_request(
+            a.identifier(),
+            b.identifier(),
+            result["new_status"],
+            result["thread_id"],
+            result["sealed"],
+        )
+        self.assertEqual(result["url"], "tcp://127.0.0.1:1337")
 
-        received = b_store.open_message(sealed)
+        received = b_store.open_message(result["sealed"])
         match received:
             case tsp.RequestRelationship(
                 sender, receiver, _route, _nested_vid, thread_id

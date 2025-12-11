@@ -11,3 +11,6 @@ gha-creds-*.json
 # mdbook generated files
 docs/mermaid.min.js
 docs/mermaid-init.js
+
+# Test artifacts
+test_wallet*.sqlite*

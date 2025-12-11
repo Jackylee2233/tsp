@@ -49,11 +49,18 @@ describe('tsp node tests', function() {
         store.add_private_vid(bob);
 
         // Alice wants to establish a relationship
-        let { url, sealed } = store.make_relationship_request(alice.identifier(), bob.identifier(), null);
+        let result = store.prepare_relationship_request(alice.identifier(), bob.identifier(), null);
+        store.commit_relationship_request(
+            alice.identifier(),
+            bob.identifier(),
+            result.new_status,
+            result.thread_id,
+            result.sealed,
+        );
 
-        assert.strictEqual(url, "tcp://127.0.0.1:1337");
+        assert.strictEqual(result.url, "tcp://127.0.0.1:1337");
 
-        let received = store.open_message(sealed);
+        let received = store.open_message(result.sealed);
 
         if (received instanceof RequestRelationship) {
             const { sender, thread_id } = received;
@@ -63,7 +70,7 @@ describe('tsp node tests', function() {
         }
 
         // Bob accepts the relationship
-        ({ url, sealed } = store.make_relationship_accept(bob.identifier(), alice.identifier(), received.thread_id, null));
+        let { url, sealed } = store.make_relationship_accept(bob.identifier(), alice.identifier(), received.thread_id, null);
 
         assert.strictEqual(url, "tcp://127.0.0.1:1337");
 
@@ -86,11 +93,18 @@ describe('tsp node tests', function() {
         store.add_private_vid(bob);
 
         // Alice wants to establish a relationship
-        let { url, sealed } = store.make_relationship_request(alice.identifier(), bob.identifier(), null);
+        let result = store.prepare_relationship_request(alice.identifier(), bob.identifier(), null);
+        store.commit_relationship_request(
+            alice.identifier(),
+            bob.identifier(),
+            result.new_status,
+            result.thread_id,
+            result.sealed,
+        );
 
-        assert.strictEqual(url, "tcp://127.0.0.1:1337");
+        assert.strictEqual(result.url, "tcp://127.0.0.1:1337");
 
-        let received = store.open_message(sealed);
+        let received = store.open_message(result.sealed);
 
         if (received instanceof RequestRelationship) {
             const { sender, thread_id } = received;
@@ -100,7 +114,7 @@ describe('tsp node tests', function() {
         }
 
         // Bob accepts the relationship
-        ({ url, sealed } = store.make_relationship_accept(bob.identifier(), alice.identifier(), received.thread_id, null));
+        let { url, sealed } = store.make_relationship_accept(bob.identifier(), alice.identifier(), received.thread_id, null);
 
         assert.strictEqual(url, "tcp://127.0.0.1:1337");
 
@@ -240,8 +254,15 @@ describe('tsp node tests', function() {
         b_store.add_private_vid(a);
 
         // Make relationship request from 'a' to 'b'
-        let {url, sealed} = a_store.make_relationship_request(a.identifier(), b.identifier(), null);
-        let received = b_store.open_message(sealed);
+        let result = a_store.prepare_relationship_request(a.identifier(), b.identifier(), null);
+        a_store.commit_relationship_request(
+            a.identifier(),
+            b.identifier(),
+            result.new_status,
+            result.thread_id,
+            result.sealed,
+        );
+        let received = b_store.open_message(result.sealed);
 
         // Pattern match for RequestRelationship in received message
         if (received instanceof RequestRelationship) {

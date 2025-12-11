@@ -228,24 +228,51 @@ impl Store {
     }
 
     #[pyo3(signature = (sender, receiver, route))]
-    fn make_relationship_request(
+    fn prepare_relationship_request<'py>(
         &self,
+        py: Python<'py>,
         sender: String,
         receiver: String,
         route: Option<Vec<String>>,
-    ) -> PyResult<(String, Vec<u8>)> {
+    ) -> PyResult<Bound<'py, PyDict>> {
         let route_items: Vec<&str> = route.iter().flatten().map(|s| s.as_str()).collect();
 
-        let (url, bytes) = self
+        let (new_status, url, sealed, thread_id) = self
             .inner
-            .make_relationship_request(
+            .as_store()
+            .prepare_relationship_request(
                 &sender,
                 &receiver,
                 route.as_ref().map(|_| route_items.as_slice()),
             )
             .map_err(py_exception)?;
 
-        Ok((url.to_string(), bytes))
+        let result = PyDict::new(py);
+        result.set_item(
+            "new_status",
+            pythonize::pythonize(py, &new_status).unwrap(),
+        )?;
+        result.set_item("url", url.to_string())?;
+        result.set_item("sealed", sealed)?;
+        result.set_item("thread_id", thread_id.to_vec())?;
+
+        Ok(result)
+    }
+
+    #[pyo3(signature = (sender, receiver, new_status, thread_id, tsp_message))]
+    fn commit_relationship_request(
+        &self,
+        sender: String,
+        receiver: String,
+        new_status: Bound<PyAny>,
+        thread_id: [u8; 32],
+        tsp_message: Vec<u8>,
+    ) -> PyResult<()> {
+        let new_status: tsp_sdk::RelationshipStatus = pythonize::depythonize(new_status.as_ref())?;
+        self.inner
+            .as_store()
+            .commit_relationship_request(&sender, &receiver, new_status, thread_id, &tsp_message)
+            .map_err(py_exception)
     }
 
     #[pyo3(signature = (sender, receiver, thread_id, route))]
