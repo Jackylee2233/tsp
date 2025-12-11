@@ -36,7 +36,7 @@ impl FromStr for DidType {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 #[command(name = "tsp", version)]
 #[command(about = "Send and receive TSP messages", long_about = None)]
 struct Cli {
@@ -65,7 +65,7 @@ struct Cli {
     yes: bool,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, Clone)]
 enum Commands {
     #[command(about = "Show information stored in the wallet")]
     Show {
@@ -206,7 +206,7 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 enum ShowCommands {
     #[command(about = "List all local VIDs")]
     Local,
@@ -218,7 +218,7 @@ enum ShowCommands {
     },
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 enum CustomSecretManagement {
     #[command(about = "Add a custom secret to the wallet")]
     Add { key: String, value: String },
@@ -278,6 +278,7 @@ async fn ensure_vid_verified(
             "Do you want to verify receiver DID {}",
             receiver_vid
         ))
+        .await
     {
         vid_wallet.verify_vid(receiver_vid, None).await?;
         info!("{receiver_vid} is verified and added to the wallet {wallet_name}");
@@ -290,14 +291,19 @@ async fn ensure_vid_verified(
     }
 }
 
-fn prompt(message: String) -> bool {
-    use std::io::{self, BufRead, Write};
-    print!("{message}? [y/n]");
-    io::stdout().flush().expect("I/O error");
+async fn prompt(message: String) -> bool {
+    use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt};
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(format!("{message}? [y/n]").as_bytes())
+        .await
+        .expect("I/O error");
+    stdout.flush().await.expect("I/O error");
     let mut line = String::new();
-    io::stdin()
-        .lock()
+    let mut stdin = io::BufReader::new(io::stdin());
+    stdin
         .read_line(&mut line)
+        .await
         .expect("could not read reply");
     line = line.to_uppercase();
 
@@ -329,9 +335,9 @@ async fn run() -> Result<(), Error> {
     CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .expect("Failed to install crypto provider");
 
+    let server: String = args.server.clone();
+    let did_server = args.did_server.clone();
     let (vault, vid_wallet) = read_wallet(&args.wallet, &args.password).await?;
-    let server: String = args.server;
-    let did_server = args.did_server;
 
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("TSP CLI / {}", env!("CARGO_PKG_VERSION")));
@@ -639,7 +645,7 @@ async fn run() -> Result<(), Error> {
                 message.len()
             );
         }
-        Commands::Receive { vid, one } => {
+        Commands::Receive { ref vid, one } => {
             let mut messages = vid_wallet.receive(&vid).await?;
             let vid = vid_wallet.try_resolve_alias(&vid)?;
 
@@ -654,156 +660,162 @@ async fn run() -> Result<(), Error> {
                 AssignDefaultRelation(String, Digest),
             }
 
+            async fn handle_message(
+                message: ReceivedTspMessage,
+                args: &Cli,
+            ) -> Result<Action, Error> {
+                match message {
+                    ReceivedTspMessage::GenericMessage {
+                        sender,
+                        receiver: _,
+                        nonconfidential_data: _,
+                        message,
+                        message_type,
+                    } => {
+                        let status = match message_type.crypto_type {
+                            cesr::CryptoType::Plaintext => "NON-CONFIDENTIAL",
+                            _ => "confidential",
+                        };
+                        let crypto_type = match message_type.crypto_type {
+                            cesr::CryptoType::Plaintext => "Plain text",
+                            cesr::CryptoType::HpkeAuth => "HPKE Auth",
+                            cesr::CryptoType::HpkeEssr => "HPKE ESSR",
+                            cesr::CryptoType::NaclAuth => "NaCl Auth",
+                            cesr::CryptoType::NaclEssr => "NaCl ESSR",
+                            #[cfg(feature = "pq")]
+                            cesr::CryptoType::X25519Kyber768Draft00 => "X25519Kyber768Draft00",
+                        };
+                        let signature_type = match message_type.signature_type {
+                            cesr::SignatureType::NoSignature => "no signature",
+                            cesr::SignatureType::Ed25519 => "Ed25519 signature",
+                            #[cfg(feature = "pq")]
+                            cesr::SignatureType::MlDsa65 => "ML-DSA-65 signature",
+                        };
+                        info!(
+                            "received {status} message ({} bytes) from {} ({crypto_type}, {signature_type})",
+                            message.len(),
+                            sender,
+                        );
+                        println!("{}", String::from_utf8_lossy(&message),);
+                    }
+                    ReceivedTspMessage::RequestRelationship {
+                        sender,
+                        receiver: _,
+                        thread_id,
+                        route: _,
+                        nested_vid,
+                    } => {
+                        let thread_id_string = Base64Unpadded::encode_string(&thread_id);
+                        match nested_vid {
+                            Some(vid) => {
+                                info!(
+                                    "received nested relationship request from '{vid}' (new identity for {sender}), thread-id '{thread_id_string}'"
+                                );
+                            }
+                            None => {
+                                info!(
+                                    "received relationship request from {sender}, thread-id '{thread_id_string}'"
+                                );
+                            }
+                        }
+
+                        return Ok(Action::AssignDefaultRelation(sender, thread_id));
+                    }
+                    ReceivedTspMessage::AcceptRelationship {
+                        sender,
+                        receiver: _,
+                        nested_vid: None,
+                    } => {
+                        info!("received accept relationship from {}", sender);
+                    }
+                    ReceivedTspMessage::AcceptRelationship {
+                        sender,
+                        receiver: _,
+                        nested_vid: Some(vid),
+                    } => {
+                        info!(
+                            "received accept nested relationship from '{vid}' (new identity for {sender})"
+                        );
+                    }
+                    ReceivedTspMessage::CancelRelationship {
+                        sender,
+                        receiver: _,
+                    } => {
+                        info!("received cancel relationship from {sender}");
+                    }
+                    ReceivedTspMessage::ForwardRequest {
+                        sender,
+                        receiver: _,
+                        route,
+                        next_hop,
+                        opaque_payload,
+                    } => {
+                        info!(
+                            "messaging forwarding request from {sender} to {next_hop} ({} hops)",
+                            route.len()
+                        );
+                        if args.yes
+                            || prompt("do you want to forward this message?".to_string()).await
+                        {
+                            return Ok(Action::Forward(next_hop, route, opaque_payload));
+                        }
+                    }
+                    ReceivedTspMessage::NewIdentifier {
+                        sender,
+                        receiver: _,
+                        new_vid,
+                    } => {
+                        info!("received request for new identifier '{new_vid}' from {sender}");
+                        return Ok(Action::Verify(new_vid));
+                    }
+                    ReceivedTspMessage::Referral {
+                        sender,
+                        receiver: _,
+                        referred_vid,
+                    } => {
+                        info!(
+                            "received relationship referral for '{referred_vid}' from {sender}"
+                        );
+                        return Ok(Action::Verify(referred_vid));
+                    }
+                    ReceivedTspMessage::PendingMessage {
+                        unknown_vid,
+                        payload,
+                    } => {
+                        info!("message involving unknown party {}", unknown_vid);
+
+                        let user_affirms = args.yes
+                            || prompt(format!(
+                                "received first time message from '{unknown_vid}', do you want to accept it?"
+                            ))
+                            .await;
+
+                        if user_affirms {
+                            trace!("processing pending message");
+                            return Ok(Action::VerifyAndOpen(unknown_vid, payload));
+                        }
+                    }
+                }
+
+                Ok(Action::Nothing)
+            }
+
+            let args_clone = args.clone();
             while let Some(message) = messages.next().await {
                 trace!("Received message: {message:?}");
                 let message = match message {
                     Ok(m) => m,
                     Err(_) => break,
                 };
-                let handle_message = |message: ReceivedTspMessage| {
-                    match message {
-                        ReceivedTspMessage::GenericMessage {
-                            sender,
-                            receiver: _,
-                            nonconfidential_data: _,
-                            message,
-                            message_type,
-                        } => {
-                            let status = match message_type.crypto_type {
-                                cesr::CryptoType::Plaintext => "NON-CONFIDENTIAL",
-                                _ => "confidential",
-                            };
-                            let crypto_type = match message_type.crypto_type {
-                                cesr::CryptoType::Plaintext => "Plain text",
-                                cesr::CryptoType::HpkeAuth => "HPKE Auth",
-                                cesr::CryptoType::HpkeEssr => "HPKE ESSR",
-                                cesr::CryptoType::NaclAuth => "NaCl Auth",
-                                cesr::CryptoType::NaclEssr => "NaCl ESSR",
-                                #[cfg(feature = "pq")]
-                                cesr::CryptoType::X25519Kyber768Draft00 => "X25519Kyber768Draft00",
-                            };
-                            let signature_type = match message_type.signature_type {
-                                cesr::SignatureType::NoSignature => "no signature",
-                                cesr::SignatureType::Ed25519 => "Ed25519 signature",
-                                #[cfg(feature = "pq")]
-                                cesr::SignatureType::MlDsa65 => "ML-DSA-65 signature",
-                            };
-                            info!(
-                                "received {status} message ({} bytes) from {} ({crypto_type}, {signature_type})",
-                                message.len(),
-                                sender,
-                            );
-                            println!("{}", String::from_utf8_lossy(&message),);
-                        }
-                        ReceivedTspMessage::RequestRelationship {
-                            sender,
-                            receiver: _,
-                            thread_id,
-                            route: _,
-                            nested_vid,
-                        } => {
-                            let thread_id_string = Base64Unpadded::encode_string(&thread_id);
-                            match nested_vid {
-                                Some(vid) => {
-                                    info!(
-                                        "received nested relationship request from '{vid}' (new identity for {sender}), thread-id '{thread_id_string}'"
-                                    );
-                                }
-                                None => {
-                                    info!(
-                                        "received relationship request from {sender}, thread-id '{thread_id_string}'"
-                                    );
-                                }
-                            }
 
-                            return Action::AssignDefaultRelation(sender, thread_id);
-                        }
-                        ReceivedTspMessage::AcceptRelationship {
-                            sender,
-                            receiver: _,
-                            nested_vid: None,
-                        } => {
-                            info!("received accept relationship from {}", sender);
-                        }
-                        ReceivedTspMessage::AcceptRelationship {
-                            sender,
-                            receiver: _,
-                            nested_vid: Some(vid),
-                        } => {
-                            info!(
-                                "received accept nested relationship from '{vid}' (new identity for {sender})"
-                            );
-                        }
-                        ReceivedTspMessage::CancelRelationship {
-                            sender,
-                            receiver: _,
-                        } => {
-                            info!("received cancel relationship from {sender}");
-                        }
-                        ReceivedTspMessage::ForwardRequest {
-                            sender,
-                            receiver: _,
-                            route,
-                            next_hop,
-                            opaque_payload,
-                        } => {
-                            info!(
-                                "messaging forwarding request from {sender} to {next_hop} ({} hops)",
-                                route.len()
-                            );
-                            if args.yes
-                                || prompt("do you want to forward this message?".to_string())
-                            {
-                                return Action::Forward(next_hop, route, opaque_payload);
-                            }
-                        }
-                        ReceivedTspMessage::NewIdentifier {
-                            sender,
-                            receiver: _,
-                            new_vid,
-                        } => {
-                            info!("received request for new identifier '{new_vid}' from {sender}");
-                            return Action::Verify(new_vid);
-                        }
-                        ReceivedTspMessage::Referral {
-                            sender,
-                            receiver: _,
-                            referred_vid,
-                        } => {
-                            info!(
-                                "received relationship referral for '{referred_vid}' from {sender}"
-                            );
-                            return Action::Verify(referred_vid);
-                        }
-                        ReceivedTspMessage::PendingMessage {
-                            unknown_vid,
-                            payload,
-                        } => {
-                            info!("message involving unknown party {}", unknown_vid);
-
-                            let user_affirms = args.yes
-                                || prompt(format!(
-                                    "received first time message from '{unknown_vid}', do you want to accept it?"
-                                ));
-
-                            if user_affirms {
-                                trace!("processing pending message");
-                                return Action::VerifyAndOpen(unknown_vid, payload);
-                            }
-                        }
-                    }
-
-                    Action::Nothing
-                };
-
-                match handle_message(message) {
+                match handle_message(message, &args_clone).await? {
                     Action::Nothing => {}
                     Action::VerifyAndOpen(remote_vid, payload) => {
                         let message = vid_wallet.verify_and_open(&remote_vid, payload).await?;
 
                         info!("{vid} is verified and added to the wallet {}", &args.wallet);
 
-                        let _ = handle_message(message);
+                        let _ = handle_message(message, &args_clone).await?;
                     }
                     Action::Verify(vid) => {
                         vid_wallet.verify_vid(&vid, None).await?;
