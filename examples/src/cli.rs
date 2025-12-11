@@ -708,13 +708,11 @@ async fn run() -> Result<(), Error> {
                                     info!(
                                         "received nested relationship request from '{vid}' (new identity for {sender}), thread-id '{thread_id_string}'"
                                     );
-                                    println!("{vid}\t{thread_id_string}");
                                 }
                                 None => {
                                     info!(
                                         "received relationship request from {sender}, thread-id '{thread_id_string}'"
                                     );
-                                    println!("{sender}\t{thread_id_string}");
                                 }
                             }
 
@@ -735,7 +733,6 @@ async fn run() -> Result<(), Error> {
                             info!(
                                 "received accept nested relationship from '{vid}' (new identity for {sender})"
                             );
-                            println!("{vid}");
                         }
                         ReceivedTspMessage::CancelRelationship {
                             sender,
@@ -766,7 +763,6 @@ async fn run() -> Result<(), Error> {
                             new_vid,
                         } => {
                             info!("received request for new identifier '{new_vid}' from {sender}");
-                            println!("{new_vid}");
                             return Action::Verify(new_vid);
                         }
                         ReceivedTspMessage::Referral {
@@ -777,7 +773,6 @@ async fn run() -> Result<(), Error> {
                             info!(
                                 "received relationship referral for '{referred_vid}' from {sender}"
                             );
-                            println!("{referred_vid}");
                             return Action::Verify(referred_vid);
                         }
                         ReceivedTspMessage::PendingMessage {
