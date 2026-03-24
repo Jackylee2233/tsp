@@ -3,6 +3,7 @@ Cargo.lock
 .tgops.toml
 .tgops
 .idea
+.agent
 notes/
 docs/book/
 data/
@@ -11,3 +12,13 @@ gha-creds-*.json
 # mdbook generated files
 docs/mermaid.min.js
 docs/mermaid-init.js
+docs/src/zh
+docs/src/mermaid.min.js
+docs/src/mermaid-init.js
+docs/src/picker.js
+
+docs/migrate_structure.py
+docs/picker.js
+docs/Makefile
+
+

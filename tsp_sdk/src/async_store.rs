@@ -97,6 +97,17 @@ impl AsyncSecureStore {
         self.inner.set_route_for_vid(vid, route)
     }
 
+    /// Record an incoming relationship request, setting the status to ReverseUnidirectional.
+    pub fn receive_relationship_request(
+        &self,
+        vid: &str,
+        sender_vid: &str,
+        thread_id: Digest,
+    ) -> Result<(), Error> {
+        self.inner
+            .receive_relationship_request(vid, sender_vid, thread_id)
+    }
+
     /// Sets the parent for a VID. This is used to create a nested message.
     pub fn set_parent_for_vid(&self, vid: &str, parent: Option<&str>) -> Result<(), Error> {
         self.inner.set_parent_for_vid(vid, parent)

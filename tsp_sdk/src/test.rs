@@ -703,3 +703,111 @@ async fn test_unverified_receiver_in_direct_mode() {
 
     assert!(matches!(err, crate::Error::UnverifiedVid(_)));
 }
+
+#[tokio::test]
+#[serial_test::serial(tcp)]
+async fn test_reverse_unidirectional_state() {
+    // bob wallet
+    let bob_db = AsyncSecureStore::new();
+    let bob_vid = OwnedVid::from_file("../examples/test/bob/piv.json")
+        .await
+        .unwrap();
+    bob_db.add_private_vid(bob_vid.clone(), None).unwrap();
+
+    // alice wallet
+    let alice_db = AsyncSecureStore::new();
+    let alice_vid = OwnedVid::from_file("../examples/test/alice/piv.json")
+        .await
+        .unwrap();
+    alice_db.add_private_vid(alice_vid.clone(), None).unwrap();
+
+    // Bob knows about Alice
+    bob_db
+        .verify_vid("did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice", None)
+        .await
+        .unwrap();
+
+    // Alice sends request
+    alice_db
+        .verify_vid("did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob", None)
+        .await
+        .unwrap();
+
+    let mut bobs_messages = bob_db
+        .receive("did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob")
+        .await
+        .unwrap();
+
+    alice_db
+        .send_relationship_request(
+            "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice",
+            "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Bob receives
+    let msg = bobs_messages.next().await.unwrap().unwrap();
+    let thread_id = if let crate::definitions::ReceivedTspMessage::RequestRelationship {
+        thread_id,
+        ..
+    } = msg
+    {
+        thread_id
+    } else {
+        panic!("Expected RequestRelationship");
+    };
+
+    // Check Bob's state (should be automatically set by open_message)
+    let status = bob_db.get_relation_status_for_vid_pair(
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob",
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice"
+    ).unwrap();
+
+    match status {
+        RelationshipStatus::ReverseUnidirectional { thread_id: tid } => {
+            assert_eq!(tid, thread_id);
+        }
+        _ => panic!("Expected ReverseUnidirectional state, got {:?}", status),
+    }
+
+    // Test Manual Helper: Reset to Unrelated and use the helper
+    // We must modify the REMOTE vid (Alice) because relation_status_for_vid_pair checks the remote VID's entry
+    bob_db.set_relation_and_status_for_vid(
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice",
+        RelationshipStatus::Unrelated,
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob"
+    ).unwrap();
+
+    // Verify reset
+    let status_reset = bob_db.get_relation_status_for_vid_pair(
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob",
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice"
+    ).unwrap();
+    assert!(matches!(status_reset, RelationshipStatus::Unrelated));
+
+    // Use helper
+    // Helper should also be called on the REMOTE VID (Alice)
+    bob_db.receive_relationship_request(
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice",
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob",
+        thread_id
+    ).unwrap();
+
+    // Verify state again
+    let status_manual = bob_db.get_relation_status_for_vid_pair(
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:bob",
+        "did:web:raw.githubusercontent.com:openwallet-foundation-labs:tsp:main:examples:test:alice"
+    ).unwrap();
+
+    match status_manual {
+        RelationshipStatus::ReverseUnidirectional { thread_id: tid } => {
+            assert_eq!(tid, thread_id);
+        }
+        _ => panic!(
+            "Expected ReverseUnidirectional state after manual set, got {:?}",
+            status_manual
+        ),
+    }
+}

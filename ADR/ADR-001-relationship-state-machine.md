@@ -97,3 +97,11 @@ When a node in `Unidirectional` state (sent a request) receives a `RequestRelati
 - **健壮性**：在网络抖动和并发情况下，关系建立将更加可靠。
 - **复杂性**：`store.rs` 的逻辑将变得更加复杂。
 - **破坏性变更**：现有的手动操作状态的测试可能会失败，需要更新以遵循状态机。
+
+### 5. Phase 1 反馈调整 (2025-12-24)
+基于初步反馈 (Phase 1)，我们在 SDK 中进行了以下改进：
+1.  **ReverseUnidirectional 辅助函数**：为了方便应用层从 Unrelated 转换到 ReverseUnidirectional 状态（例如在手动处理请求或恢复状态时），在 `SecureStore` 和 `AsyncSecureStore` 中增加了一个便捷函数 `receive_relationship_request`。
+2.  **测试增强**：增加了集成测试 (`test_reverse_unidirectional_state`)，专门覆盖接收请求后的状态验证以及辅助函数的使用，弥补了之前测试路径的不足。
+
+未来的调整（计划中）：
+- 这里将记录关于并发处理和幂等性的进一步修正。

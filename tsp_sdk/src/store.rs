@@ -348,6 +348,21 @@ impl SecureStore {
         })
     }
 
+    /// Record an incoming relationship request, setting the status to ReverseUnidirectional.
+    /// This is a convenience wrapper around `set_relation_and_status_for_vid`.
+    pub fn receive_relationship_request(
+        &self,
+        vid: &str,
+        sender_vid: &str,
+        thread_id: Digest,
+    ) -> Result<(), Error> {
+        self.set_relation_and_status_for_vid(
+            vid,
+            RelationshipStatus::ReverseUnidirectional { thread_id },
+            sender_vid,
+        )
+    }
+
     /// Adds a route to an already existing VID, making it a nested VID
     pub fn set_route_for_vid(
         &self,
