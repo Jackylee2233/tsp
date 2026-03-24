@@ -94,6 +94,8 @@ pub mod crypto;
 /// Defines several common data structures, traits and error types that are used throughout the project.
 pub mod definitions;
 mod error;
+#[cfg(feature = "resolve")]
+mod http_client;
 mod store;
 
 /// Contains code for handling *verified identifiers* and identities.
@@ -115,6 +117,13 @@ mod secure_storage;
 #[cfg(feature = "async")]
 #[cfg(test)]
 mod test;
+
+/// Test utilities and helpers for writing tests.
+///
+/// This module is available when compiling tests and provides
+/// common utilities for creating test VIDs, stores, and assertions.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 
 #[cfg(feature = "async")]
 pub use async_store::AsyncSecureStore;

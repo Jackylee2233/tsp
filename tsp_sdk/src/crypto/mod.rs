@@ -213,7 +213,7 @@ pub fn gen_encrypt_keypair() -> (PrivateKeyData, PublicKeyData) {
     )
 }
 
-#[cfg(feature = "nacl")]
+#[cfg(all(feature = "nacl", not(feature = "pq")))]
 /// Generate a new encryption / decryption key pair
 pub fn gen_encrypt_keypair() -> (PrivateKeyData, PublicKeyData) {
     let private_key = crypto_box::SecretKey::generate(&mut OsRng);
@@ -260,12 +260,9 @@ mod tests {
     fn seal_open_message() {
         let alice = OwnedVid::bind(
             "did:test:alice",
-            Url::parse("tcp:://127.0.0.1:13371").unwrap(),
+            Url::parse("tcp://127.0.0.1:13371").unwrap(),
         );
-        let bob = OwnedVid::bind(
-            "did:test:bob",
-            Url::parse("tcp:://127.0.0.1:13372").unwrap(),
-        );
+        let bob = OwnedVid::bind("did:test:bob", Url::parse("tcp://127.0.0.1:13372").unwrap());
 
         let secret_message: &[u8] = b"hello world";
         let nonconfidential_data = b"extra header data";
